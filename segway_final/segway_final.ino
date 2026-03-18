@@ -214,16 +214,12 @@ void setup() {
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
-  const int pwmFreq = 2000;
-  const int pwmResolution = 8;
-  ledcSetup(MOTOR_CH_R1, pwmFreq, pwmResolution);
-  ledcAttachPin(RPWM1, MOTOR_CH_R1);
-  ledcSetup(MOTOR_CH_L1, pwmFreq, pwmResolution);
-  ledcAttachPin(LPWM1, MOTOR_CH_L1);
-  ledcSetup(MOTOR_CH_R2, pwmFreq, pwmResolution);
-  ledcAttachPin(RPWM2, MOTOR_CH_R2);
-  ledcSetup(MOTOR_CH_L2, pwmFreq, pwmResolution);
-  ledcAttachPin(LPWM2, MOTOR_CH_L2);
+  // Note: ESP32 Arduino core 3.3.x does not expose ledcSetup / ledcAttachPin.
+  // Use the older ledcAttach API instead.
+  ledcAttach(MOTOR_CH_R1, RPWM1);
+  ledcAttach(MOTOR_CH_L1, LPWM1);
+  ledcAttach(MOTOR_CH_R2, RPWM2);
+  ledcAttach(MOTOR_CH_L2, LPWM2);
 
   stopMotors();
 
@@ -252,7 +248,7 @@ void setup() {
 
 void resetCommandTimeout() {
   lastCommandMillis = millis();
-  commandTimeoutActive = false;
+  commandTimeoutActive = true;
 }
 
 void handleBluetooth() {
@@ -348,6 +344,7 @@ void loop() {
     if (!btConnected) {
       btConnected = true;
       Serial.println("Bluetooth verbunden");
+      resetCommandTimeout();
     }
   } else {
     if (btConnected) {
@@ -405,6 +402,17 @@ void loop() {
     stopMotors();
     Serial.println("Too much tilt - stopped");
     delay(50);
+    return;
+  }
+
+  // If we didn't receive fresh Bluetooth commands recently, stop motors.
+  if (commandTimeoutActive && (millis() - lastCommandMillis) > COMMAND_TIMEOUT_MS) {
+    commandTimeoutActive = false;
+    Serial.println("Command timeout - stoppe Motoren");
+    targetAngle = 0;
+    turnPWM = 0;
+    speedValue = 0;
+    stopMotors();
     return;
   }
 
