@@ -12,11 +12,21 @@ dependencies:
   flutter_bluetooth_serial: ^0.4.0
   sensors_plus: ^3.0.0
   permission_handler: ^11.0.1
+  flutter_svg: ^2.0.7
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.0
+
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "data/img/segway_icon.svg"
+  adaptive_icon_background: "#000000"
 
 flutter:
   uses-material-design: true
+  assets:
+    - data/img/segway_icon.svg

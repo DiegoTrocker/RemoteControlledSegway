@@ -1405,16 +1405,19 @@ class _SegwayControllerPageState extends State<SegwayControllerPage> {
           const SizedBox(height: 16),
           _buildToggleSetting(
             label: 'Vibration',
+            icon: Icons.vibration,
             value: _vibrationEnabled,
             onChanged: (v) => setState(() => _vibrationEnabled = v),
           ),
           _buildToggleSetting(
             label: 'Sound',
+            icon: Icons.volume_up,
             value: _soundEnabled,
             onChanged: (v) => setState(() => _soundEnabled = v),
           ),
           _buildToggleSetting(
             label: 'Auto-Zentrierung',
+            icon: Icons.center_focus_strong,
             value: _autoCenteringEnabled,
             onChanged: (v) => setState(() => _autoCenteringEnabled = v),
           ),
@@ -1425,31 +1428,22 @@ class _SegwayControllerPageState extends State<SegwayControllerPage> {
 
   Widget _buildToggleSetting({
     required String label,
+    required IconData icon,
     required bool value,
     required ValueChanged<bool> onChanged,
   }) {
-    return Container(
+    return Card(
       margin: const EdgeInsets.only(top: 12),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
-        gradient: const LinearGradient(
-          colors: [Color(0xFF0A2F2F), Color(0xFF003333)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: const TextStyle(fontSize: 16)),
-          Switch(
-            value: value,
-            onChanged: onChanged,
-            activeThumbColor: Colors.greenAccent,
-          ),
-        ],
+      color: const Color(0x59000000),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: SwitchListTile.adaptive(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        secondary: Icon(icon, color: Colors.greenAccent),
+        title: Text(label, style: const TextStyle(fontSize: 16)),
+        value: value,
+        onChanged: onChanged,
+        activeThumbColor: Colors.greenAccent,
+        activeTrackColor: const Color(0x6600FF00),
       ),
     );
   }
@@ -1458,6 +1452,9 @@ class _SegwayControllerPageState extends State<SegwayControllerPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        backgroundColor: Colors.black87,
+        elevation: 0,
+        centerTitle: true,
         title: Text(_activeScreen == AppScreen.home
             ? 'RoboControl'
             : _activeScreen == AppScreen.modeSelection
@@ -1467,14 +1464,23 @@ class _SegwayControllerPageState extends State<SegwayControllerPage> {
                     : 'Einstellungen'),
       ),
       backgroundColor: Colors.black,
-      body: SafeArea(
-        child: _activeScreen == AppScreen.home
-            ? _buildHomeScreen()
-            : _activeScreen == AppScreen.modeSelection
-                ? _buildModeSelectionScreen()
-                : _activeScreen == AppScreen.drive
-                    ? _buildDriveScreen()
-                    : _buildSettingsScreen(),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            colors: [Color(0xFF000000), Color(0xFF061414)],
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+          ),
+        ),
+        child: SafeArea(
+          child: _activeScreen == AppScreen.home
+              ? _buildHomeScreen()
+              : _activeScreen == AppScreen.modeSelection
+                  ? _buildModeSelectionScreen()
+                  : _activeScreen == AppScreen.drive
+                      ? _buildDriveScreen()
+                      : _buildSettingsScreen(),
+        ),
       ),
     );
   }

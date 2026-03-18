@@ -6,9 +6,24 @@
 #include "esp_err.h"
 
 #define MPU_ADDR 0x68
+
+// PWM channels (ESP32 supports 16 channels: 0..15)
+const int MOTOR_CH_R1 = 0;
+const int MOTOR_CH_L1 = 1;
+const int MOTOR_CH_R2 = 2;
+const int MOTOR_CH_L2 = 3;
+
 BluetoothSerial SerialBT;
 bool btConnected = false;
-String btReceived = "";
+
+// Timeout to stop the motors in case we stop receiving commands.
+const unsigned long COMMAND_TIMEOUT_MS = 2000;
+unsigned long lastCommandMillis = 0;
+bool commandTimeoutActive = false;
+
+// Incoming Bluetooth command buffer (avoid dynamic Strings to reduce heap fragmentation)
+char btReceived[65];
+size_t btReceivedLen = 0;
 
 // ---------------- Motor pins ----------------
 const int RPWM1 = 25;
@@ -31,13 +46,14 @@ int turnValue = 50;  // 0..100 (50 = centered)
 int speedValue = 0;  // -100..100 (negative = reverse)
 
 // Tune these
-float Kp = 18.0;
-float Kd = 1.2;
+float Kp = 14.0;            // proportional gain (tilt correction)
+float Kd = 0.8;             // derivative gain (damping / dampen gyro response)
+float gyroSensitivity = 0.6; // scale how strongly the gyro rate affects correction (0..1)
 
 // Motor behavior
 int minPWM = 70;       // minimum usable PWM to overcome motor deadzone
 int maxPWM = 255;
-float deadband = 0.1;  // tiny deadband for noise near zero
+float deadband = 0.2;  // small deadband to ignore tiny noise around zero
 
 // Debug timing
 unsigned long lastPrint = 0;
@@ -99,24 +115,24 @@ bool readMPU(float &accAngle, float &gyroRate) {
 
 // ---------- Motor helpers ----------
 void stopMotors() {
-  ledcWrite(RPWM1, 0);
-  ledcWrite(LPWM1, 0);
-  ledcWrite(RPWM2, 0);
-  ledcWrite(LPWM2, 0);
+  ledcWrite(MOTOR_CH_R1, 0);
+  ledcWrite(MOTOR_CH_L1, 0);
+  ledcWrite(MOTOR_CH_R2, 0);
+  ledcWrite(MOTOR_CH_L2, 0);
 }
 
-static void applyMotor(int pwm, int rpwm, int lpwm) {
+static void applyMotor(int pwm, int chForward, int chReverse) {
   pwm = constrain(pwm, -maxPWM, maxPWM);
 
   if (pwm > 0) {
-    ledcWrite(rpwm, pwm);
-    ledcWrite(lpwm, 0);
+    ledcWrite(chForward, pwm);
+    ledcWrite(chReverse, 0);
   } else if (pwm < 0) {
-    ledcWrite(rpwm, 0);
-    ledcWrite(lpwm, -pwm);
+    ledcWrite(chForward, 0);
+    ledcWrite(chReverse, -pwm);
   } else {
-    ledcWrite(rpwm, 0);
-    ledcWrite(lpwm, 0);
+    ledcWrite(chForward, 0);
+    ledcWrite(chReverse, 0);
   }
 }
 
@@ -124,8 +140,8 @@ void setMotors(int pwmLeft, int pwmRight) {
   pwmLeft = constrain(pwmLeft, -maxPWM, maxPWM);
   pwmRight = constrain(pwmRight, -maxPWM, maxPWM);
 
-  applyMotor(pwmLeft, RPWM1, LPWM1);
-  applyMotor(pwmRight, RPWM2, LPWM2);
+  applyMotor(pwmLeft, MOTOR_CH_R1, MOTOR_CH_L1);
+  applyMotor(pwmRight, MOTOR_CH_R2, MOTOR_CH_L2);
 }
 
 void setMotorPair(int pwm) {
@@ -198,10 +214,16 @@ void setup() {
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
-  ledcAttach(RPWM1, 2000, 8);
-  ledcAttach(LPWM1, 2000, 8);
-  ledcAttach(RPWM2, 2000, 8);
-  ledcAttach(LPWM2, 2000, 8);
+  const int pwmFreq = 2000;
+  const int pwmResolution = 8;
+  ledcSetup(MOTOR_CH_R1, pwmFreq, pwmResolution);
+  ledcAttachPin(RPWM1, MOTOR_CH_R1);
+  ledcSetup(MOTOR_CH_L1, pwmFreq, pwmResolution);
+  ledcAttachPin(LPWM1, MOTOR_CH_L1);
+  ledcSetup(MOTOR_CH_R2, pwmFreq, pwmResolution);
+  ledcAttachPin(RPWM2, MOTOR_CH_R2);
+  ledcSetup(MOTOR_CH_L2, pwmFreq, pwmResolution);
+  ledcAttachPin(LPWM2, MOTOR_CH_L2);
 
   stopMotors();
 
@@ -228,6 +250,11 @@ void setup() {
   Serial.println(gyroYoffset);
 }
 
+void resetCommandTimeout() {
+  lastCommandMillis = millis();
+  commandTimeoutActive = false;
+}
+
 void handleBluetooth() {
   if (!SerialBT.connected()) return;
 
@@ -236,53 +263,63 @@ void handleBluetooth() {
     if (c == '\r') continue;
 
     // Legacy single-key commands (immediate response)
+    bool gotCommand = true;
     switch (c) {
       case 'w':
       case 'W':
         speedValue = 100;
-        continue;
+        break;
 
       case 's':
       case 'S':
         speedValue = -100;
-        continue;
+        break;
 
       case 'x':
       case 'X':
         speedValue = 0;
-        continue;
+        break;
 
       case 'a':
       case 'A':
         turnValue = 0;
-        continue;
+        break;
 
       case 'd':
       case 'D':
         turnValue = 100;
-        continue;
+        break;
 
       case 'q':
       case 'Q':
         turnValue = 50;
-        continue;
+        break;
 
       default:
+        gotCommand = false;
         break;
+    }
+
+    if (gotCommand) {
+      resetCommandTimeout();
+      continue;
     }
 
     // New format: S<0-100>V<-100..100> (example: S50V80)
     if (c == '\n') {
-      String cmd = btReceived;
-      btReceived = "";
-      cmd.trim();
-      if (cmd.isEmpty()) continue;
+      btReceived[btReceivedLen] = '\0';
+      btReceivedLen = 0;
 
-      int sIndex = cmd.indexOf('S');
-      int vIndex = cmd.indexOf('V');
-      if (sIndex != -1 && vIndex != -1) {
-        int steer = cmd.substring(sIndex + 1, vIndex).toInt();
-        int speed = cmd.substring(vIndex + 1).toInt();
+      // copy into a temporary buffer and normalize to uppercase
+      char cmd[65] = "";
+      for (size_t i = 0; i < sizeof(cmd) - 1 && btReceived[i] != '\0'; ++i) {
+        cmd[i] = toupper((unsigned char)btReceived[i]);
+        cmd[i + 1] = '\0';
+      }
+
+      int steer = -1;
+      int speed = 0;
+      if (sscanf(cmd, "S%dV%d", &steer, &speed) == 2) {
         if (steer >= 0 && steer <= 100) {
           turnValue = steer;
         }
@@ -290,12 +327,18 @@ void handleBluetooth() {
           speedValue = speed;
         }
       }
+
+      resetCommandTimeout();
       continue;
     }
 
     // Accumulate non-button data for multi-byte commands.
-    btReceived += c;
-    if (btReceived.length() > 64) btReceived = ""; // prevent runaway buffering
+    if (btReceivedLen < sizeof(btReceived) - 1) {
+      btReceived[btReceivedLen++] = c;
+    } else {
+      // Buffer overflow - reset to recover
+      btReceivedLen = 0;
+    }
   }
 }
 
@@ -313,6 +356,8 @@ void loop() {
       targetAngle = 0;
       turnPWM = 0;
       speedValue = 0;
+      btReceivedLen = 0;
+      commandTimeoutActive = false;
       stopMotors();
     }
   }
@@ -353,7 +398,7 @@ void loop() {
 
   // PD control
   float error = targetAngle - pitch;
-  float output = Kp * error - Kd * gyroRate;
+  float output = Kp * error - Kd * gyroRate * gyroSensitivity;
 
   // safety cutoff
   if (abs(pitch) > 30) {
