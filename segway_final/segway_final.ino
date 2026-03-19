@@ -36,7 +36,7 @@ float gyroYoffset = 0.0;
 
 // Low-pass filtered gyro rate for smoother control
 float gyroRateFiltered = 0.0;
-const float gyroFilterAlpha = 0.25; // 0..1, lower = smoother but more lag
+const float gyroFilterAlpha = 0.75; // 0..1, höherer Anteil für kaum Verzögerung, aber stabiler als zuvor
 
 unsigned long lastMicros = 0;
 
@@ -48,15 +48,20 @@ int turnPWM = 0;
 int turnValue = 50;  // 0..100 (50 = centered)
 int speedValue = 0;  // -100..100 (negative = reverse)
 
+// MPU fault tracking for transient I2C failure handling
+int mpuErrorCount = 0;
+const int MPU_ERROR_RESET_THRESHOLD = 20;
+
 // Tune these (adjust for stability / responsiveness)
-float Kp = 10.0;            // proportional gain (tilt correction)
-float Kd = 1.5;             // derivative gain (damping / dampen gyro response)
-float gyroSensitivity = 0.6; // scale how strongly the gyro rate affects correction (0..1)
+float Kp = 20.0;            // proportional gain (tilt correction): noch stark, aber weniger ruckartig
+float Kd = 1.2;             // derivative gain (damping): erhöht für glattere Regelaktion
+float gyroSensitivity = 0.65; // scale how strongly the gyro rate affects correction (0..1)
+float gyroFeedforward = 0.5; // weniger direkter Feedforward, um Ruckler zu mindern
 
 // Motor behavior
-int minPWM = 60;       // minimum usable PWM to overcome motor deadzone
+int minPWM = 18;       // leicht höher, damit kleine Vibrationen nicht nachrutschen
 int maxPWM = 255;
-float deadband = 0.4;  // small deadband to ignore tiny noise around zero
+float deadband = 0.0;  // kein totbereich, aber bei slowcore nutzen wir eigenes Dämpfungsband
 
 // Debug timing
 unsigned long lastPrint = 0;
@@ -91,6 +96,15 @@ void setupMPU() {
   mpuWrite(0x6B, 0x00);  // wake up
   mpuWrite(0x1C, 0x00);  // accel ±2g
   mpuWrite(0x1B, 0x00);  // gyro ±250 dps
+}
+
+void recoverMPU() {
+  Serial.println("MPU I2C recovery: Wire reset...");
+  Wire.end();
+  delay(10);
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  setupMPU();
 }
 
 bool readMPU(float &accAngle, float &gyroRate) {
@@ -376,18 +390,36 @@ void loop() {
   if (abs(turnPWM) < 5) turnPWM = 0;
 
   // Speed: -100..100 mapped to a target lean angle.
-  const float maxTargetAngle = 10.0f;
+  const float maxTargetAngle = 6.0f; // engerer Bereich, damit er weniger hohe Kippwinkel anstrebt
   targetAngle = (speedValue / 100.0f) * maxTargetAngle;
   if (abs(speedValue) < 10) {
     targetAngle = 0;
   }
 
   if (!readMPU(accAngle, gyroRate)) {
-    Serial.println("MPU read failed");
-    stopMotors();
-    delay(20);
-    return;
+    mpuErrorCount++;
+    Serial.print("MPU read failed (count=");
+    Serial.print(mpuErrorCount);
+    Serial.println(")");
+
+    if (mpuErrorCount >= MPU_ERROR_RESET_THRESHOLD) {
+      Serial.println("MPU connection unstable, neu initialisieren...");
+      stopMotors();
+      recoverMPU();
+      if (calibrateMPU()) {
+        Serial.println("MPU neu kalibriert.");
+      } else {
+        Serial.println("MPU Kalibrierung fehlgeschlagen.");
+      }
+      mpuErrorCount = 0;
+    }
+
+    // Keine schnelle Abbruch-Schleife, einfach weiter versuchen.
+    setMotors(0, 0);  // auf Nummer sicher: Motoren stoppen für Auslesefehler
+    delay(10);
+    return; // kurz abwarten, sensor kann neu kommen
   }
+  mpuErrorCount = 0;
 
   unsigned long now = micros();
   float dt = (now - lastMicros) / 1000000.0f;
@@ -407,8 +439,24 @@ void loop() {
   float error = targetAngle - pitch;
   float output = Kp * error - Kd * gyroRateUsed * gyroSensitivity;
 
+  // Feedforward auf Gyro-Korrektur für jedes kleinste Gyro-Signal
+  output += gyroFeedforward * gyroRateUsed;
+
+  // smooth scaling: bei großen Neigungen aktiv dämpfen (verhindert Umfallen)
+  float safetyScale = 1.0f;
+  if (abs(pitch) > 8.0f) safetyScale = 0.85f;
+  if (abs(pitch) > 12.0f) safetyScale = 0.7f;
+  output *= safetyScale;
+
+  // small-angle amplification für starken, aber nicht ruckartigen Antrieb
+  const float smallTiltThreshold = 6.0f;
+  const float smallTiltBoost = 1.2f;
+  if (abs(error) <= smallTiltThreshold) {
+    output *= smallTiltBoost;
+  }
+
   // safety cutoff
-  if (abs(pitch) > 30) {
+  if (abs(pitch) > 22) {
     stopMotors();
     Serial.println("Too much tilt - stopped");
     delay(50);
@@ -427,18 +475,26 @@ void loop() {
   }
 
   // Convert control output to PWM
-  int pwm = (int)output;
+  int targetPwm = (int)output;
+  int pwm = lastPwm; // Startpunkt (wird in den nächsten Zeilen überschrieben)
 
-  // Smooth out very large step changes to avoid aggressive jerks.
-  const int maxPwmStep = 20; // max delta per loop
-  pwm = constrain(pwm, lastPwm - maxPwmStep, lastPwm + maxPwmStep);
+  // Stepwise change: proportional output wird langsam in PWM umgesetzt.
+  // Das verhindert 0->100 Sprünge beim schnellen Tiltwechsel.
+  const int maxPwmStep = 18; // max delta per loop -> sanfte Änderung
+  if (targetPwm > lastPwm) {
+    pwm = min(lastPwm + maxPwmStep, targetPwm);
+  } else if (targetPwm < lastPwm) {
+    pwm = max(lastPwm - maxPwmStep, targetPwm);
+  } else {
+    pwm = targetPwm;
+  }
   lastPwm = pwm;
 
-  // Tiny deadband only for very small noise near zero
-  if (abs(error) < deadband && abs(gyroRate) < 1.0f) {
+  // leichtes Deadband für sehr ruhiges Verhalten
+  if (abs(error) < 0.08f && abs(gyroRate) < 0.2f) {
     pwm = 0;
   } else {
-    // Ensure we exceed motor deadzone without over-boosting large outputs.
+    // Ensure we exceed motor deadzone without over-boosting große Outputs.
     if (pwm > 0 && pwm < minPWM) pwm = minPWM;
     if (pwm < 0 && pwm > -minPWM) pwm = -minPWM;
   }
@@ -449,7 +505,7 @@ void loop() {
   int rightPwm = pwm - turnPWM;
   setMotors(leftPwm, rightPwm);
 
-  // Print less often so control loop is smoother
+  // Print less often so control loop bleibt schnell.
   if (millis() - lastPrint >= 50) {
     lastPrint = millis();
     Serial.print("pitch=");
@@ -464,5 +520,5 @@ void loop() {
     Serial.println(pwm);
   }
 
-  delay(5);
+  delay(0); // maximal schnelle Loop-Rate
 }
