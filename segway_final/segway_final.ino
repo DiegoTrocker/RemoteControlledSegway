@@ -7,11 +7,9 @@
 
 #define MPU_ADDR 0x68
 
-// PWM channels (ESP32 supports 16 channels: 0..15)
-const int MOTOR_CH_R1 = 0;
-const int MOTOR_CH_L1 = 1;
-const int MOTOR_CH_R2 = 2;
-const int MOTOR_CH_L2 = 3;
+// PWM configuration
+const int PWM_FREQ = 2000;
+const int PWM_RESOLUTION = 8;
 
 BluetoothSerial SerialBT;
 bool btConnected = false;
@@ -35,6 +33,11 @@ const int LPWM2 = 14;
 float pitch = 0.0;
 float pitchOffset = 0.0;
 float gyroYoffset = 0.0;
+
+// Low-pass filtered gyro rate for smoother control
+float gyroRateFiltered = 0.0;
+const float gyroFilterAlpha = 0.25; // 0..1, lower = smoother but more lag
+
 unsigned long lastMicros = 0;
 
 // ---------------- Control ----------------
@@ -45,18 +48,21 @@ int turnPWM = 0;
 int turnValue = 50;  // 0..100 (50 = centered)
 int speedValue = 0;  // -100..100 (negative = reverse)
 
-// Tune these
-float Kp = 14.0;            // proportional gain (tilt correction)
-float Kd = 0.8;             // derivative gain (damping / dampen gyro response)
+// Tune these (adjust for stability / responsiveness)
+float Kp = 10.0;            // proportional gain (tilt correction)
+float Kd = 1.5;             // derivative gain (damping / dampen gyro response)
 float gyroSensitivity = 0.6; // scale how strongly the gyro rate affects correction (0..1)
 
 // Motor behavior
-int minPWM = 70;       // minimum usable PWM to overcome motor deadzone
+int minPWM = 60;       // minimum usable PWM to overcome motor deadzone
 int maxPWM = 255;
-float deadband = 0.2;  // small deadband to ignore tiny noise around zero
+float deadband = 0.4;  // small deadband to ignore tiny noise around zero
 
 // Debug timing
 unsigned long lastPrint = 0;
+
+// Smooth PWM changes to prevent sudden aggressive corrections
+int lastPwm = 0;
 
 // ---------- MPU helpers ----------
 void mpuWrite(byte reg, byte value) {
@@ -115,24 +121,24 @@ bool readMPU(float &accAngle, float &gyroRate) {
 
 // ---------- Motor helpers ----------
 void stopMotors() {
-  ledcWrite(MOTOR_CH_R1, 0);
-  ledcWrite(MOTOR_CH_L1, 0);
-  ledcWrite(MOTOR_CH_R2, 0);
-  ledcWrite(MOTOR_CH_L2, 0);
+  ledcWrite(RPWM1, 0);
+  ledcWrite(LPWM1, 0);
+  ledcWrite(RPWM2, 0);
+  ledcWrite(LPWM2, 0);
 }
 
-static void applyMotor(int pwm, int chForward, int chReverse) {
+static void applyMotor(int pwm, int pinForward, int pinReverse) {
   pwm = constrain(pwm, -maxPWM, maxPWM);
 
   if (pwm > 0) {
-    ledcWrite(chForward, pwm);
-    ledcWrite(chReverse, 0);
+    ledcWrite(pinForward, pwm);
+    ledcWrite(pinReverse, 0);
   } else if (pwm < 0) {
-    ledcWrite(chForward, 0);
-    ledcWrite(chReverse, -pwm);
+    ledcWrite(pinForward, 0);
+    ledcWrite(pinReverse, -pwm);
   } else {
-    ledcWrite(chForward, 0);
-    ledcWrite(chReverse, 0);
+    ledcWrite(pinForward, 0);
+    ledcWrite(pinReverse, 0);
   }
 }
 
@@ -140,8 +146,8 @@ void setMotors(int pwmLeft, int pwmRight) {
   pwmLeft = constrain(pwmLeft, -maxPWM, maxPWM);
   pwmRight = constrain(pwmRight, -maxPWM, maxPWM);
 
-  applyMotor(pwmLeft, MOTOR_CH_R1, MOTOR_CH_L1);
-  applyMotor(pwmRight, MOTOR_CH_R2, MOTOR_CH_L2);
+  applyMotor(pwmLeft, RPWM1, LPWM1);
+  applyMotor(pwmRight, RPWM2, LPWM2);
 }
 
 void setMotorPair(int pwm) {
@@ -214,12 +220,12 @@ void setup() {
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
-  // Note: ESP32 Arduino core 3.3.x does not expose ledcSetup / ledcAttachPin.
-  // Use the older ledcAttach API instead.
-  ledcAttach(MOTOR_CH_R1, RPWM1);
-  ledcAttach(MOTOR_CH_L1, LPWM1);
-  ledcAttach(MOTOR_CH_R2, RPWM2);
-  ledcAttach(MOTOR_CH_L2, LPWM2);
+  // Configure PWM on motor pins.
+  // NOTE: ESP32 Arduino core 3.3.7 uses ledcAttach(pin, freq, resolution).
+  ledcAttach(RPWM1, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(LPWM1, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(RPWM2, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(LPWM2, PWM_FREQ, PWM_RESOLUTION);
 
   stopMotors();
 
@@ -393,9 +399,13 @@ void loop() {
   float accCorrected = accAngle - pitchOffset;
   pitch = 0.98 * (pitch + gyroRate * dt) + 0.02 * accCorrected;
 
+  // Low-pass filter the gyro rate to avoid aggressive spikes
+  gyroRateFiltered = (gyroFilterAlpha * gyroRate) + ((1 - gyroFilterAlpha) * gyroRateFiltered);
+  float gyroRateUsed = gyroRateFiltered;
+
   // PD control
   float error = targetAngle - pitch;
-  float output = Kp * error - Kd * gyroRate * gyroSensitivity;
+  float output = Kp * error - Kd * gyroRateUsed * gyroSensitivity;
 
   // safety cutoff
   if (abs(pitch) > 30) {
@@ -419,13 +429,18 @@ void loop() {
   // Convert control output to PWM
   int pwm = (int)output;
 
+  // Smooth out very large step changes to avoid aggressive jerks.
+  const int maxPwmStep = 20; // max delta per loop
+  pwm = constrain(pwm, lastPwm - maxPwmStep, lastPwm + maxPwmStep);
+  lastPwm = pwm;
+
   // Tiny deadband only for very small noise near zero
   if (abs(error) < deadband && abs(gyroRate) < 1.0f) {
     pwm = 0;
   } else {
-    // Add minimum PWM smoothly to overcome motor deadzone
-    if (pwm > 0) pwm += minPWM;
-    if (pwm < 0) pwm -= minPWM;
+    // Ensure we exceed motor deadzone without over-boosting large outputs.
+    if (pwm > 0 && pwm < minPWM) pwm = minPWM;
+    if (pwm < 0 && pwm > -minPWM) pwm = -minPWM;
   }
 
   pwm = constrain(pwm, -maxPWM, maxPWM);
